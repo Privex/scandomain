@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+##########################################################################
+# Simple Domain Record Scanner which wraps 'dig'
+# Allows you to quickly query multiple record types
+# against a domain in one command, and can display
+# the records in several different formats
+#
+##########################################################################
+#
+#   ScanDomain tool - Version 1.0.0
+#   (C) 2023 Privex Inc. / Someguy123
+#
+#   Privex Website: https://www.privex.io
+#         Git Repo: https://github.com/Privex/scandomain
+#          License: X11 / MIT
+#
+##########################################################################
+#
+# Examples:
+#
+#     $ scandomain privex.io
+#     Scanning domain 'privex.io' for records: a aaaa ns mx soa txt
+#     Dig flags:
+#     Found a records:
+#
+#         185.130.44.10
+#
+#     Found aaaa records:
+#
+#         2a07:e00::abc
+#
+#     ... (trimmed for brevity, would show NS + SOA + MX + TXT as well)
+#
+#     $ scandomain -r a,aaaa -f -q privex.io files.privex.io
+#     185.130.44.10
+#     2a07:e00::abc
+#     88.99.98.148
+#     2a01:4f9:3a:1bd0::8
+#
+##########################################################################
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+
+DIG_FLAGS=()
+XDOMAINS=()
+: ${QUIET=0}
+: ${COMPACT=0}
+: ${FLAT=0}
+: ${REC_TYPES="a,aaaa,ns,mx,soa,txt"}
+
+IFS=',' read -ra _REC_TYPES <<< "$REC_TYPES"
+
+REC_TYPES=("${_REC_TYPES[@]}")
+
+##########################################################################################
+# Colour code / msg functions taken from .zsh_files/colors.zsh
+# within the open source project https://github.com/Someguy123/someguy-scripts
+# Licensed under MIT + written by Someguy123
+##########################################################################################
+
+
+# Use colors, but only if connected to a terminal, and that terminal
+# supports them.
+if which tput >/dev/null 2>&1; then
+    ncolors=$(tput colors)
+fi
+
+BOLD="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" WHITE="" RESET="" NORMAL=""
+if [ -t 1 ]; then
+    BOLD="$(tput bold)" RED="$(tput setaf 1)" GREEN="$(tput setaf 2)" YELLOW="$(tput setaf 3)" BLUE="$(tput setaf 4)"
+    MAGENTA="$(tput setaf 5)" CYAN="$(tput setaf 6)" WHITE="$(tput setaf 7)" RESET="$(tput sgr0)" NORMAL="$(tput sgr0)"
+fi
+
+
+#####
+# Easy coloured messages function
+# Written by @someguy123
+# Usage:
+#   # Prints "hello" and "world" across two lines in the default terminal color
+#   msg "hello\nworld"
+#
+#   # Prints "    this is an example" in green text
+#   msg green "\tthis" is an example
+#
+#   # Prints "An error has occurred" in bold red text
+#   msg bold red "An error has occurred"
+#
+#####
+msg() {
+    if [[ "$#" -eq 0 ]]; then echo ""; return; fi;
+    if [[ "$#" -eq 1 ]]; then
+        echo -e "$1"
+        return
+    fi
+    [[ "$1" == "ts" ]] && shift && _msg="[$(date +'%Y-%m-%d %H:%M:%S %Z')] " || _msg=""
+    if [[ "$#" -gt 2 ]] && [[ "$1" == "bold" ]]; then
+        echo -n "${BOLD}"
+        shift
+    fi
+    (($#==1)) && _msg+="$@" || _msg+="${@:2}"
+
+    case "$1" in
+        bold) echo -e "${BOLD}${_msg}${RESET}";;
+        BLUE|blue) echo -e "${BLUE}${_msg}${RESET}";;
+        YELLOW|yellow) echo -e "${YELLOW}${_msg}${RESET}";;
+        RED|red) echo -e "${RED}${_msg}${RESET}";;
+        GREEN|green) echo -e "${GREEN}${_msg}${RESET}";;
+        CYAN|cyan) echo -e "${CYAN}${_msg}${RESET}";;
+        MAGENTA|magenta|PURPLE|purple) echo -e "${MAGENTA}${_msg}${RESET}";;
+        * ) echo -e "${_msg}";;
+    esac
+}
+
+# Alias for 'msg' function with timestamp on the left.
+msgts() {
+    msg ts "${@:1}"
+}
+
+msgerr() {
+    # Same as `msg` but outputs to stderr instead of stdout
+    >&2 msg "$@"
+}
+
+# make msg + colors available to subshells
+# use -f for msg if using bash
+export -f msg msgts msgerr
+export RED GREEN YELLOW BLUE CYAN MAGENTA WHITE BOLD NORMAL RESET
+
+##########################################################################################
+# End of Colour Codes / MSG functions from someguy-scripts/.zsh_files/colors.zsh
+##########################################################################################
+
+
+_help() {
+    msg bold cyan "Usage:${RESET}${CYAN} $0 [-q|-f|-c|-t rectypes|...] domain [domain2...] (@1.1.1.1) (+flag) (+otherflag ...)"
+    msg
+    msg cyan "  Scan DNS records for one or more domains using 'dig'"
+    msg
+    msg bold cyan "  (C) 2023 Privex Inc. / Someguy123"
+    msg cyan      "      https://www.privex.io  ||   https://github.com/Privex/scandomain"
+    msg cyan      "      License: X11 / MIT"
+    msg
+    msg bold cyan "Flags:\n"
+    msg cyan "    --quiet|-q)     Quiet mode - don't display record type not found messages, nor 'Scanning domain x' / 'Dig flags:'"
+    msg
+    msg cyan "            --compact|-c)      Compact mode - display records in a compact way like so:\n"
+    msg cyan "                                   a: 1.2.3.4  23.45.67.89\n"
+    msg cyan "                                   aaaa: 2001:123::456  2001:456::abc\n"
+    msg cyan "                                   txt: \"hello world\" \"lorem ipsum dolor\" \"testing 1 2 3 4\"\n"
+    msg
+    msg cyan "               --flat|-f)      Flat mode - display records as a flat combined list of lines like so:\n"
+    msg cyan "                                   1.2.3.4"
+    msg cyan "                                   3.4.5.6"
+    msg cyan "                                   2001:123::456"
+    msg cyan "                                   \"hello world\""
+    msg cyan "                                   \"lorem ipsum dolor\""
+    msg
+    msg cyan "     --types|-t|-r TYPES)      Override the record types to fetch, comma separated list, example:\n"
+    msg cyan "                                   # Fetch only the A and AAAA records for google.com"
+    msg cyan "                                   $0 -r a,aaaa google.com\n"
+    msg cyan "                                   # Fetch the A, NS, DS, SOA, and MX records for privex.io"
+    msg cyan "                                   $0 -r a,ns,soa,ds,mx privex.io\n"
+    msg cyan "                                   # Fetch ONLY the AAAA records for privex.io"
+    msg cyan "                                   $0 -r aaaa privex.io\n"
+    msg
+    msg bold yellow "Examples:\n"
+    msg yellow      "    # Fetch the default record types (${REC_TYPES[*]}) for privex.io"
+    msg yellow      "    $0 privex.io\n" 
+    msg yellow      "    # Fetch the default record types (${REC_TYPES[*]}) for privex.io in compact + quiet mode"
+    msg yellow      "    $0 -c -q privex.io\n" 
+    msg yellow      "    # Fetch the default record types (${REC_TYPES[*]}) for privex.io using nameserver 185.130.44.20"
+    msg yellow      "    $0 privex.io @185.130.44.20\n"
+    msg yellow      "    # Fetch just A + AAAA in flat mode for privex.io, google.com, and example.com"
+    msg yellow      "    $0 -f -r a,aaaa privex.io google.com example.com\n"
+    msg yellow      "    # Fetch just A + AAAA for example.com from nameserver 9.9.9.9 and validate + return DNSSEC record"
+    msg yellow      "    $0 -r a,aaaa +dnssec example.com @9.9.9.9\n"
+    msg
+
+}
+
+_scan-domain() {
+    dig +short "$1" "$2" "${DIG_FLAGS[@]}"
+}
+
+scan-domain() {
+    (( QUIET )) || msg green "Scanning domain '$1' for records:${RESET} ${REC_TYPES[*]}"
+    (( QUIET )) || msg green "Dig flags:${RESET} ${DIG_FLAGS[*]}"
+
+    # Iterate over each record type and query the domain for it,
+    # then display the record(s) in the appropriate format
+    for rt in "${REC_TYPES[@]}"; do
+        _res="$(_scan-domain "$rt" "$1")"
+        # Empty response = no records
+        if [[ -z "$_res" ]]; then
+            (( QUIET )) || msg yellow "No $rt records found.\n"
+        else
+            # Split response by newlines
+            _IFS="$IFS"
+            IFS=$'\n' l_res=($_res)
+            IFS="$_IFS"
+
+            # Display the records in either normal, flat, or compact mode
+            if (( COMPACT )); then
+                msg bold cyan "${rt}:${RESET} ${l_res[*]}\n"
+            elif (( FLAT )); then
+                for rec in "${l_res[@]}"; do
+                    msg "$rec"
+                done
+            else
+                msg bold cyan "Found ${rt} records:\n"
+                for rec in "${l_res[@]}"; do
+                    msg cyan "\t$rec"
+                done
+                msg
+            fi
+        fi
+    done
+}
+
+scan-domains() {
+    # x="$1"
+    # for x in "$@"; do
+    if (( $# == 0 )); then
+        _help
+        exit 2
+    fi
+
+    while (( $# > 0 )); do
+        x="$1"
+        # If argument starts with '-' then it's a flag/switch for this tool and should be parsed
+        if [[ "$x" =~ ^\- ]]; then
+            case "$x" in
+                --quiet|-q) QUIET=1;;
+                --compact|-c) COMPACT=1;;
+                --flat|-f) FLAT=1;;
+                --types|-t|-r)
+                    REC_TYPES="$2"
+                    IFS=',' read -ra _REC_TYPES <<< "$REC_TYPES"
+                    REC_TYPES=("${_REC_TYPES[@]}")
+                    shift
+                    ;;
+                -h|--help) _help; exit;;
+                *) DIG_FLAGS+=("$x");;
+            esac
+        # If argument starts with '@' or '+' then it's an argument that should be
+        # passed to 'dig' to set the nameserver or add flags
+        elif [[ "$x" =~ ^@ ]] || [[ "$x" =~ ^\+ ]]; then
+            DIG_FLAGS+=("$x")
+        # Otherwise, the argument is just a domain and should be added to the domain list
+        else
+            XDOMAINS+=("$x")
+        fi
+        shift
+    done
+    # Iterate over the domain list and pass them to scan-domain which handles
+    # looking up their records and printing them
+    for dom in "${XDOMAINS[@]}"; do
+        scan-domain "$dom"
+    done
+}
+
+scan-domains "$@"
+exit $? 
+
+
+##########################################################################
+#
+#   (C) 2023 Privex Inc. / Someguy123
+#
+#   Privex Website: https://www.privex.io
+#         Git Repo: https://github.com/Privex/scandomain
+#          License: X11 / MIT
+#
+##########################################################################
+
